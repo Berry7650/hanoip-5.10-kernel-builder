@@ -1,0 +1,76 @@
+name: Hanoip Kernel 5.10 Compilation
+
+on:
+  # push ইভেন্টে বা ম্যানুয়ালি রান করার জন্য
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout Workflow Repository
+        uses: actions/checkout@v4
+        with:
+          path: self-repo
+          
+      - name: 2. Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git build-essential bison flex libssl-dev libncurses5-dev \
+            libelf-dev python3 python3-pip lz4 bc ccache
+          
+      - name: 3. Prepare Workspace and Clone 5.10 Source
+        run: |
+          # 5.10 ভার্সন-এর কার্নেল সোর্স ক্লোন করা (Moto Common Base)
+          git clone https://github.com/moto-common/android_kernel_motorola_msm-5.10.git hanoip_kernel_510
+          
+          # Clang toolchain ক্লোন করা (Proton Clang)
+          git clone https://github.com/kdrag0n/proton-clang.git clang-toolchain
+          
+      - name: 4. Set Environment Variables
+        run: |
+          TOOLCHAIN_PATH=$(realpath clang-toolchain)
+          
+          echo "ARCH=arm64" >> $GITHUB_ENV
+          echo "SUBARCH=arm64" >> $GITHUB_ENV
+          
+          # Toolchain Path এবং Prefixes সেট করা
+          echo "PATH=$TOOLCHAIN_PATH/bin:$PATH" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabihf-" >> $GITHUB_ENV
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          
+      - name: 5. Build Kernel Configuration (5.10)
+        run: |
+          cd hanoip_kernel_510
+          make O=out clean
+          make O=out mrproper
+          
+          # স্টক ৪.১৪ কনফিগারেশন ফাইলটি ৫.১০ সোর্সে কপি করা হচ্ছে।
+          # .txt এক্সটেনশন সহ ফাইলটি ব্যবহার করা হলো।
+          cp ../self-repo/hanoip_defconfig.txt arch/arm64/configs/hanoip_510_defconfig 
+          
+          # নতুন কনফিগারেশন ফাইল ব্যবহার করে তৈরি করা
+          make O=out hanoip_510_defconfig
+          # olddefconfig ব্যবহার করে নতুন ৫.১০ ভার্সনের অপশনগুলি মার্জ করা হলো।
+          make O=out olddefconfig
+
+      - name: 6. Start Kernel Compilation (5.10)
+        run: |
+          cd hanoip_kernel_510
+          echo "Starting build with $(nproc) threads..."
+          
+          # কম্পাইল শুরু করা
+          make O=out -j$(nproc)
+
+      - name: 7. Archive and Upload Built Kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: hanoip-kernel-5.10-${{ github.sha }}
+          path: hanoip_kernel_510/out/arch/arm64/boot/Image.lz4-dtb
+          if-no-files-found: error
+          retention-days: 7
