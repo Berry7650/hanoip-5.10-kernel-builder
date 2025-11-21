@@ -1,7 +1,6 @@
-name: Hanoip Kernel 5.10 Compilation Workflow
+name: Hanoip Kernel 5.10 Build (Moto G40 Fusion)
 
 on:
-  # Trigger the workflow on push events to 'main' or manually
   push:
     branches: [ main ]
   workflow_dispatch:
@@ -9,85 +8,96 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
-      - name: 1. Checkout Workflow Repository
-        uses: actions/checkout@v4
-        with:
-          path: self-repo
-          
-      - name: 2. Install Build Dependencies (Required packages)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y git build-essential bison flex libssl-dev libncurses5-dev \
-            libelf-dev python3 python3-pip lz4 bc ccache
-          
-      - name: 3. Clone Kernel Source and Toolchain
-        run: |
-          # Clone the 5.10 kernel source (Moto Common Base) into the 'hanoip_kernel_510' directory.
-          git clone https://github.com/moto-common/android_kernel_motorola_msm-5.10.git hanoip_kernel_510
-          
-          # Clone the Proton Clang toolchain
-          git clone https://github.com/kdrag0n/proton-clang.git clang-toolchain
-          
-      - name: 4. Set Environment Variables for Cross-Compilation
-        run: |
-          TOOLCHAIN_PATH=$(realpath clang-toolchain)
-          
-          # Ensure all binaries in the toolchain are executable (Robustness check)
-          chmod -R +x $TOOLCHAIN_PATH/bin
-          
-          # Target Architecture setup
-          echo "ARCH=arm64" >> $GITHUB_ENV
-          echo "SUBARCH=arm64" >> $GITHUB_ENV
-          
-          # Set the Cross-Compilation toolchain path and prefixes
-          echo "PATH=$TOOLCHAIN_PATH/bin:$PATH" >> $GITHUB_ENV
-          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabihf-" >> $GITHUB_ENV
-          echo "CC=clang" >> $GITHUB_ENV
-          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
-          
-          # Enable ccache for faster incremental builds
-          echo "USE_CCACHE=1" >> $GITHUB_ENV
-          
-          # FIX (Critical): Explicitly set the HOST tools using their full system path 
-          # to prevent the AArch64 linker from being used for native (x86_64) host tools like fixdep.
-          echo "HOSTCC=/usr/bin/gcc" >> $GITHUB_ENV
-          echo "HOSTLD=/usr/bin/ld" >> $GITHUB_ENV
-          
-      - name: 5. Prepare Kernel Configuration
-        run: |
-          cd hanoip_kernel_510
-          # Clean old output and configuration files
-          make O=out clean
-          make O=out mrproper
-          
-          # Copy the custom defconfig from the repo to the source tree
-          cp ../self-repo/hanoip_defconfig.txt arch/arm64/configs/hanoip_510_defconfig 
-          
-          # Create and update the final .config file
-          make O=out hanoip_510_defconfig
-          make O=out olddefconfig
 
-      - name: 6. Start Kernel Compilation
-        run: |
-          cd hanoip_kernel_510
-          echo "Starting build with $(nproc) threads..."
-          
-          # Start the multi-threaded kernel compilation
-          make O=out -j$(nproc)
+    # -----------------------------
+    # 1. Checkout this repository
+    # -----------------------------
+    - name: Checkout Workflow Repository
+      uses: actions/checkout@v4
+      with:
+        path: self-repo
 
-      - name: 7. Rename Output to .img Format
-        run: |
-          # Rename the raw output file (Image.lz4-dtb) to the standard .img format
-          mv hanoip_kernel_510/out/arch/arm64/boot/Image.lz4-dtb hanoip_kernel_510/out/arch/arm64/boot/hanoip_kernel.img
-          
-      - name: 8. Archive and Upload Built Kernel
-        uses: actions/upload-artifact@v4
-        with:
-          name: hanoip-kernel-5.10-${{ github.sha }}
-          # Upload the renamed .img file as a workflow artifact
-          path: hanoip_kernel_510/out/arch/arm64/boot/hanoip_kernel.img
-          if-no-files-found: error
-          retention-days: 7
+    # ----------------------------------------
+    # 2. Install required kernel build packages
+    # ----------------------------------------
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          git build-essential bison flex libssl-dev libncurses5-dev \
+          libelf-dev python3 python3-pip lz4 bc ccache
+
+    # ----------------------------------------
+    # 3. Clone Kernel Source + Clang Toolchain
+    # ----------------------------------------
+    - name: Clone Kernel Source and Toolchain
+      run: |
+        git clone https://github.com/moto-common/android_kernel_motorola_msm-5.10.git hanoip_kernel_510
+        git clone https://github.com/kdrag0n/proton-clang.git clang-toolchain
+
+    # ---------------------------------------------------------------
+    # 4. Export environment variables for 64-bit Moto SD7xx compilation
+    # ---------------------------------------------------------------
+    - name: Set Environment Variables
+      run: |
+        TOOLCHAIN_PATH=$(realpath clang-toolchain)
+
+        chmod -R +x $TOOLCHAIN_PATH/bin
+
+        echo "ARCH=arm64" >> $GITHUB_ENV
+        echo "SUBARCH=arm64" >> $GITHUB_ENV
+
+        echo "PATH=$TOOLCHAIN_PATH/bin:$PATH" >> $GITHUB_ENV
+        echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+        echo "CROSS_COMPILE_ARM32=arm-linux-gnueabihf-" >> $GITHUB_ENV
+        echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+        echo "CC=clang" >> $GITHUB_ENV
+
+        echo "USE_CCACHE=1" >> $GITHUB_ENV
+
+        echo "HOSTCC=/usr/bin/gcc" >> $GITHUB_ENV
+        echo "HOSTLD=/usr/bin/ld" >> $GITHUB_ENV
+
+    # ------------------------------------------
+    # 5. Import Custom Defconfig & Generate .config
+    # ------------------------------------------
+    - name: Prepare Kernel Configuration
+      run: |
+        cd hanoip_kernel_510
+        make O=out clean
+        make O=out mrproper
+
+        cp ../self-repo/hanoip_defconfig.txt arch/arm64/configs/hanoip_510_defconfig
+
+        make O=out hanoip_510_defconfig HOSTLD=/usr/bin/ld
+        make O=out olddefconfig HOSTLD=/usr/bin/ld
+
+    # -------------------------
+    # 6. Begin Kernel Build
+    # -------------------------
+    - name: Compile Kernel
+      run: |
+        cd hanoip_kernel_510
+        echo "Starting build using $(nproc) threads..."
+        make O=out -j$(nproc) HOSTLD=/usr/bin/ld
+
+    # ---------------------------------------------------
+    # 7. Rename final image to standard boot image format
+    # ---------------------------------------------------
+    - name: Package .img Output
+      run: |
+        mv hanoip_kernel_510/out/arch/arm64/boot/Image.lz4-dtb \
+           hanoip_kernel_510/out/arch/arm64/boot/hanoip_kernel.img
+
+    # ----------------------------------------------
+    # 8. Upload artifact (.img kernel output)
+    # ----------------------------------------------
+    - name: Upload Built Kernel
+      uses: actions/upload-artifact@v4
+      with:
+        name: hanoip-kernel-5.10-${{ github.sha }}
+        path: hanoip_kernel_510/out/arch/arm64/boot/hanoip_kernel.img
+        if-no-files-found: error
+        retention-days: 7
