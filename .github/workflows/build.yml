@@ -44,6 +44,9 @@ jobs:
           echo "CROSS_COMPILE_ARM32=arm-linux-gnueabihf-" >> $GITHUB_ENV
           echo "CC=clang" >> $GITHUB_ENV
           echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          # হোস্টের টুলস (যেমন fixdep) কম্পাইল করার জন্য নেটিভ GCC ব্যবহার নিশ্চিত করা। (ত্রুটি সমাধান)
+          echo "HOSTCC=gcc" >> $GITHUB_ENV
+          echo "HOSTLD=ld" >> $GITHUB_ENV
           
       - name: 5. Build Kernel Configuration (5.10)
         run: |
