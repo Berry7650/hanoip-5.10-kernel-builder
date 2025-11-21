@@ -25,6 +25,7 @@ jobs:
       - name: 3. Prepare Workspace and Clone 5.10 Source
         run: |
           # 5.10 ভার্সন-এর কার্নেল সোর্স ক্লোন করা (Moto Common Base)
+          # 'hanoip_kernel_510' ফোল্ডারে ক্লোন করা হচ্ছে।
           git clone https://github.com/moto-common/android_kernel_motorola_msm-5.10.git hanoip_kernel_510
           
           # Clang toolchain ক্লোন করা (Proton Clang)
@@ -67,10 +68,16 @@ jobs:
           # কম্পাইল শুরু করা
           make O=out -j$(nproc)
 
-      - name: 7. Archive and Upload Built Kernel
+      - name: 7. Rename Output to .img
+        run: |
+          # Image.lz4-dtb ফাইলটিকে hanoip_kernel.img নামে পরিবর্তন করা হলো
+          mv hanoip_kernel_510/out/arch/arm64/boot/Image.lz4-dtb hanoip_kernel_510/out/arch/arm64/boot/hanoip_kernel.img
+          
+      - name: 8. Archive and Upload Built Kernel
         uses: actions/upload-artifact@v4
         with:
           name: hanoip-kernel-5.10-${{ github.sha }}
-          path: hanoip_kernel_510/out/arch/arm64/boot/Image.lz4-dtb
+          # নতুন .img ফাইলটি আপলোড করা
+          path: hanoip_kernel_510/out/arch/arm64/boot/hanoip_kernel.img
           if-no-files-found: error
           retention-days: 7
