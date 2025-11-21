@@ -1,103 +1,95 @@
 name: Hanoip Kernel 5.10 Build (Moto G40 Fusion)
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
-  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
 
-    # -----------------------------
-    # 1. Checkout this repository
-    # -----------------------------
-    - name: Checkout Workflow Repository
+    # 1. Checkout your repository (contains hanoip_defconfig.txt)
+    - name: Checkout repo
       uses: actions/checkout@v4
       with:
         path: self-repo
 
-    # ----------------------------------------
-    # 2. Install required kernel build packages
-    # ----------------------------------------
-    - name: Install Build Dependencies
+    # 2. Install build dependencies
+    - name: Install required packages
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          git build-essential bison flex libssl-dev libncurses5-dev \
-          libelf-dev python3 python3-pip lz4 bc ccache
+        sudo apt update
+        sudo apt install -y bc bison flex build-essential lz4 ccache \
+          libssl-dev libelf-dev libncurses5-dev python3 python3-pip git
 
-    # ----------------------------------------
-    # 3. Clone Kernel Source + Clang Toolchain
-    # ----------------------------------------
-    - name: Clone Kernel Source and Toolchain
+    # 3. Clone Motorola Kernel 5.10 source code
+    - name: Clone Motorola kernel source
       run: |
-        git clone https://github.com/moto-common/android_kernel_motorola_msm-5.10.git hanoip_kernel_510
-        git clone https://github.com/kdrag0n/proton-clang.git clang-toolchain
+        git clone https://github.com/moto-common/android_kernel_motorola_msm-5.10.git kernel
 
-    # ---------------------------------------------------------------
-    # 4. Export environment variables for 64-bit Moto SD7xx compilation
-    # ---------------------------------------------------------------
-    - name: Set Environment Variables
+    # 4. Clone Proton Clang toolchain
+    - name: Clone Proton Clang
       run: |
-        TOOLCHAIN_PATH=$(realpath clang-toolchain)
+        git clone https://github.com/kdrag0n/proton-clang.git clang
 
-        chmod -R +x $TOOLCHAIN_PATH/bin
+    # 5. Fix missing Motorola cc-wrapper
+    - name: Fix missing Motorola cc-wrapper
+      run: |
+        if [ ! -f kernel/scripts/basic/cc-wrapper ]; then
+            echo "Fixing: cc-wrapper missing..."
+            curl -Lo kernel/scripts/basic/cc-wrapper \
+              https://raw.githubusercontent.com/moto-common/android_kernel_motorola_sm6225/lineage-21/scripts/basic/cc-wrapper
+            chmod +x kernel/scripts/basic/cc-wrapper
+        fi
 
+    # 6. Setup environment for Clang cross-compiling
+    - name: Setup environment variables
+      run: |
         echo "ARCH=arm64" >> $GITHUB_ENV
         echo "SUBARCH=arm64" >> $GITHUB_ENV
+        echo "CC=clang" >> $GITHUB_ENV
+        echo "LLVM=1" >> $GITHUB_ENV
 
+        TOOLCHAIN_PATH=$(realpath clang)
         echo "PATH=$TOOLCHAIN_PATH/bin:$PATH" >> $GITHUB_ENV
         echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-        echo "CROSS_COMPILE_ARM32=arm-linux-gnueabihf-" >> $GITHUB_ENV
+        echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> $GITHUB_ENV
         echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
-        echo "CC=clang" >> $GITHUB_ENV
 
-        echo "USE_CCACHE=1" >> $GITHUB_ENV
-
-        echo "HOSTCC=/usr/bin/gcc" >> $GITHUB_ENV
-        echo "HOSTLD=/usr/bin/ld" >> $GITHUB_ENV
-
-    # ------------------------------------------
-    # 5. Import Custom Defconfig & Generate .config
-    # ------------------------------------------
-    - name: Prepare Kernel Configuration
+    # 7. Apply your custom defconfig
+    - name: Copy your custom defconfig
       run: |
-        cd hanoip_kernel_510
-        make O=out clean
-        make O=out mrproper
+        cp self-repo/hanoip_defconfig.txt kernel/arch/arm64/configs/hanoip_defconfig
 
-        cp ../self-repo/hanoip_defconfig.txt arch/arm64/configs/hanoip_510_defconfig
-
-        make O=out hanoip_510_defconfig HOSTLD=/usr/bin/ld
-        make O=out olddefconfig HOSTLD=/usr/bin/ld
-
-    # -------------------------
-    # 6. Begin Kernel Build
-    # -------------------------
-    - name: Compile Kernel
+    # 8. Generate .config from your defconfig
+    - name: Create config
+      working-directory: kernel
       run: |
-        cd hanoip_kernel_510
-        echo "Starting build using $(nproc) threads..."
-        make O=out -j$(nproc) HOSTLD=/usr/bin/ld
+        make O=out hanoip_defconfig
 
-    # ---------------------------------------------------
-    # 7. Rename final image to standard boot image format
-    # ---------------------------------------------------
-    - name: Package .img Output
+    # 9. Compile the kernel
+    - name: Build kernel
+      working-directory: kernel
       run: |
-        mv hanoip_kernel_510/out/arch/arm64/boot/Image.lz4-dtb \
-           hanoip_kernel_510/out/arch/arm64/boot/hanoip_kernel.img
+        echo "Building with $(nproc) threads..."
+        make -j$(nproc) O=out
 
-    # ----------------------------------------------
-    # 8. Upload artifact (.img kernel output)
-    # ----------------------------------------------
-    - name: Upload Built Kernel
+    # 10. Output: Rename Image.lz4-dtb → hanoip_kernel.img
+    - name: Rename output image
+      run: |
+        mv kernel/out/arch/arm64/boot/Image.lz4-dtb \
+           kernel/out/arch/arm64/boot/hanoip_kernel.img
+
+    # 11. Upload compiled kernel
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: hanoip-kernel-5.10-${{ github.sha }}
-        path: hanoip_kernel_510/out/arch/arm64/boot/hanoip_kernel.img
+        name: Hanoip-Kernel-${{ github.sha }}
+        path: |
+          kernel/out/arch/arm64/boot/hanoip_kernel.img
+          kernel/out/arch/arm64/boot/dts/**/*.dtb
+          kernel/out/arch/arm64/boot/dts/**/*.dtbo
         if-no-files-found: error
         retention-days: 7
