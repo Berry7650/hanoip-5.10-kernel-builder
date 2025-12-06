@@ -17,12 +17,12 @@ jobs:
       with:
         path: self-repo
 
-    # 2. Install build dependencies
+    # 2. Install build dependencies (include curl)
     - name: Install required packages
       run: |
         sudo apt update
         sudo apt install -y bc bison flex build-essential lz4 ccache \
-          libssl-dev libelf-dev libncurses5-dev python3 python3-pip git
+          libssl-dev libelf-dev libncurses5-dev python3 python3-pip git curl
 
     # 3. Clone Motorola Kernel 5.10 source code
     - name: Clone Motorola kernel source
@@ -38,10 +38,12 @@ jobs:
     - name: Fix missing Motorola cc-wrapper
       run: |
         if [ ! -f kernel/scripts/basic/cc-wrapper ]; then
-            echo "Fixing: cc-wrapper missing..."
-            curl -Lo kernel/scripts/basic/cc-wrapper \
-              https://raw.githubusercontent.com/moto-common/android_kernel_motorola_sm6225/lineage-21/scripts/basic/cc-wrapper
-            chmod +x kernel/scripts/basic/cc-wrapper
+          echo "Fixing: cc-wrapper missing..."
+          curl -Lo kernel/scripts/basic/cc-wrapper \
+            https://raw.githubusercontent.com/moto-common/android_kernel_motorola_sm6225/lineage-21/scripts/basic/cc-wrapper
+          chmod +x kernel/scripts/basic/cc-wrapper
+        else
+          echo "cc-wrapper already exists; skipping."
         fi
 
     # 6. Setup environment for Clang cross-compiling
@@ -61,7 +63,12 @@ jobs:
     # 7. Apply your custom defconfig
     - name: Copy your custom defconfig
       run: |
-        cp self-repo/hanoip_defconfig.txt kernel/arch/arm64/configs/hanoip_defconfig
+        if [ -f self-repo/hanoip_defconfig.txt ]; then
+          cp self-repo/hanoip_defconfig.txt kernel/arch/arm64/configs/hanoip_defconfig
+        else
+          echo "ERROR: self-repo/hanoip_defconfig.txt not found"
+          exit 1
+        fi
 
     # 8. Generate .config from your defconfig
     - name: Create config
@@ -79,8 +86,14 @@ jobs:
     # 10. Output: Rename Image.lz4-dtb → hanoip_kernel.img
     - name: Rename output image
       run: |
-        mv kernel/out/arch/arm64/boot/Image.lz4-dtb \
-           kernel/out/arch/arm64/boot/hanoip_kernel.img
+        OUT_IMG=kernel/out/arch/arm64/boot/Image.lz4-dtb
+        if [ -f "$OUT_IMG" ]; then
+          mv "$OUT_IMG" kernel/out/arch/arm64/boot/hanoip_kernel.img
+        else
+          echo "ERROR: expected output image not found at $OUT_IMG"
+          ls -la kernel/out/arch/arm64/boot || true
+          exit 1
+        fi
 
     # 11. Upload compiled kernel
     - name: Upload Artifact
