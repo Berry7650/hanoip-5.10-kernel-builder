@@ -13,7 +13,6 @@ jobs:
     env:
       ARCH: arm64
       DEFCONFIG: hanoip_defconfig
-      # যদি আপনার রেপোতে stock ramdisk থাকে তাহলে AK_RAMDISK=true করে দিন (optional)
       AK_RAMDISK: "false"
 
     steps:
@@ -44,9 +43,7 @@ jobs:
         git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 $HOME/prebuilts/clang || true
         CLANG_DIR=$(ls -d $HOME/prebuilts/clang/host/linux-x86/clang-r* 2>/dev/null | head -n1 || true)
         if [ -z "$CLANG_DIR" ]; then
-          echo "No clang-r* found — aborting"
-          ls -la $HOME/prebuilts/clang/host/linux-x86 || true
-          exit 1
+          echo "No clang-r* found — aborting" ; ls -la $HOME/prebuilts/clang/host/linux-x86 || true ; exit 1
         fi
         echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
 
@@ -56,9 +53,7 @@ jobs:
         git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86 $HOME/prebuilts/gcc || true
         AARCH64_TC=$(ls -d $HOME/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-* 2>/dev/null | head -n1 || true)
         if [ -z "$AARCH64_TC" ]; then
-          echo "No aarch64 toolchain found — aborting"
-          ls -la $HOME/prebuilts/gcc/linux-x86/aarch64 || true
-          exit 1
+          echo "No aarch64 toolchain found — aborting" ; ls -la $HOME/prebuilts/gcc/linux-x86/aarch64 || true ; exit 1
         fi
         echo "AARCH64_TC=$AARCH64_TC" >> $GITHUB_ENV
 
@@ -74,10 +69,8 @@ jobs:
       env:
         PATH: ${{ env.PATH }}
       run: |
-        echo "clang:"
-        ${CLANG_DIR}/bin/clang --version | head -n 2 || true
-        echo "aarch64 gcc:"
-        ${AARCH64_TC}/bin/aarch64-linux-android-gcc --version | head -n 2 || true
+        echo "clang:"; ${CLANG_DIR}/bin/clang --version | head -n 2 || true
+        echo "aarch64 gcc:"; ${AARCH64_TC}/bin/aarch64-linux-android-gcc --version | head -n 2 || true
 
     - name: Configure kernel (defconfig)
       env:
@@ -116,7 +109,7 @@ jobs:
 
     - name: Collect build artifacts (raw)
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: kernel-raw-artifacts
         path: |
@@ -128,12 +121,11 @@ jobs:
           modules_pkg/**
 
     ####################################################################
-    # KernelSU integration steps (ADD)
+    # KernelSU integration steps
     ####################################################################
 
     - name: Clone KernelSU repo (tiann/KernelSU)
       run: |
-        # clone official KernelSU so we can attempt LKM build or integration
         git clone --depth=1 https://github.com/tiann/KernelSU.git kernelsu || true
         ls -la kernelsu || true
 
@@ -146,42 +138,29 @@ jobs:
       run: |
         set -euo pipefail
         cd kernelsu || exit 0
-
-        # Try official build script if present (common pattern)
         if [ -x ./build/build.sh ]; then
-          echo "Found build/build.sh — trying to build LKM"
-          # LTO and BUILD_CONFIG are sometimes required; this is best-effort
           export LTO=thin
           export BUILD_CONFIG=common/build.config.gki.aarch64 || true
           ./build/build.sh lkm || true
         fi
-
-        # Try legacy lkm build targets (best-effort)
         if [ -d lkm ] || [ -f Makefile ]; then
-          echo "Trying to build lkm via make (fallback)"
           make -C . -j$(nproc) || true
         fi
-
-        # Search for produced artifacts (common names)
         mkdir -p ksuresult
         find . -type f -name "*.ko" -o -name "ksu*" -o -name "lkm*.tar*" -o -name "*.so" -print0 | xargs -0 -I{} cp -v --parents "{}" ksuresult/ || true
-        echo "KernelSU build artifacts copied to kernelsu/ksuresult (if any)"
+        echo "KernelSU artifacts copied to kernelsu/ksuresult (if any)"
         ls -la ksuresult || true
 
     - name: Integrate KernelSU artifacts into AnyKernel
       run: |
         AK=anykernel
         mkdir -p $AK/modules/kernelsu
-        # If KernelSU produced compiled kernel module(s), copy them into AnyKernel modules folder
         if [ -d kernelsu/ksuresult ] && [ "$(ls -A kernelsu/ksuresult 2>/dev/null || true)" != "" ]; then
-          echo "Copying KernelSU artifacts into $AK/modules/kernelsu"
           rsync -a kernelsu/ksuresult/ $AK/modules/kernelsu/ || true
         else
-          echo "No KernelSU built artifacts found in kernelsu/ksuresult — skipping copy"
+          echo "No KernelSU built artifacts found — skipping copy"
         fi
-        # Also allow user to include prebuilt KernelSU module (if they placed it in repo/prebuilt_kernelsu/)
         if [ -d ./prebuilt_kernelsu ]; then
-          echo "Found prebuilt_kernelsu in repo — copying into AnyKernel modules/"
           rsync -a ./prebuilt_kernelsu/ $AK/modules/kernelsu/ || true
         fi
         ls -la $AK/modules || true
@@ -200,23 +179,13 @@ jobs:
         set -e
         AK=anykernel
         mkdir -p $AK/kernel
-        if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
-          cp out/arch/arm64/boot/Image.gz-dtb $AK/kernel/Image.gz-dtb
-        fi
-        if [ -f out/arch/arm64/boot/Image ]; then
-          cp out/arch/arm64/boot/Image $AK/kernel/Image
-        fi
-        if [ -f out/arch/arm64/boot/Image.gz ]; then
-          cp out/arch/arm64/boot/Image.gz $AK/kernel/Image.gz
-        fi
-        if [ -f out/arch/arm64/boot/dtbo.img ]; then
-          cp out/arch/arm64/boot/dtbo.img $AK/kernel/dtbo.img
-        fi
-        # copy any modules (including KernelSU ones added earlier)
-        if [ -d anykernel/modules ]; then
-          echo "AnyKernel modules present:"
-          ls -la anykernel/modules || true
-        fi
+        if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then cp out/arch/arm64/boot/Image.gz-dtb $AK/kernel/Image.gz-dtb; fi
+        if [ -f out/arch/arm64/boot/Image ]; then cp out/arch/arm64/boot/Image $AK/kernel/Image; fi
+        if [ -f out/arch/arm64/boot/Image.gz ]; then cp out/arch/arm64/boot/Image.gz $AK/kernel/Image.gz; fi
+        if [ -f out/arch/arm64/boot/dtbo.img ]; then cp out/arch/arm64/boot/dtbo.img $AK/kernel/dtbo.img; fi
+        if [ -d modules_pkg/lib ]; then rsync -a modules_pkg/lib/ $AK/modules/ || true; fi
+        ls -la $AK/kernel || true
+        ls -la $AK/modules || true
 
     - name: Prepare ramdisk (use ./ramdisk/ or extract stock_boot.img)
       run: |
@@ -228,7 +197,7 @@ jobs:
           mkdir -p $AK/ramdisk
           gzip -dc ramdisk.cpio.gz | (cd $AK/ramdisk && cpio -idmv) || true
         else
-          echo "No ramdisk/ or stock_boot.img found — AnyKernel will be kernel-only (may fail on some devices)"
+          echo "No ramdisk/ or stock_boot.img found — kernel-only AnyKernel zip will be created."
         fi
 
     - name: Build AnyKernel3 flashable ZIP (with KernelSU if present)
@@ -243,7 +212,7 @@ jobs:
 
     - name: Upload AnyKernel3 ZIP artifact (with KernelSU if included)
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: anykernel-zip
         path: anykernel-build-*.zip
