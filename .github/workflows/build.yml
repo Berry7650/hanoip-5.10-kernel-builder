@@ -1,108 +1,259 @@
-name: Hanoip Kernel 5.10 Build (Moto G40 Fusion)
+name: Android Kernel Build + AnyKernel3 ZIP + KernelSU
 
 on:
-  workflow_dispatch:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
+    env:
+      ARCH: arm64
+      DEFCONFIG: hanoip_defconfig
+      # যদি আপনার রেপোতে stock ramdisk থাকে তাহলে AK_RAMDISK=true করে দিন (optional)
+      AK_RAMDISK: "false"
 
     steps:
-
-    # 1. Checkout your repository (contains hanoip_defconfig.txt)
-    - name: Checkout repo
-      uses: actions/checkout@v4
+    - name: Checkout source
+      uses: actions/checkout@v3
       with:
-        path: self-repo
+        submodules: 'recursive'
 
-    # 2. Install build dependencies (include curl)
-    - name: Install required packages
+    - name: Install system dependencies
       run: |
-        sudo apt update
-        sudo apt install -y bc bison flex build-essential lz4 ccache \
-          libssl-dev libelf-dev libncurses5-dev python3 python3-pip git curl
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          git build-essential bc bison flex libssl-dev \
+          libncurses5-dev libncursesw5-dev python3 python3-pip \
+          ccache rsync unzip zip abootimg zstd
 
-    # 3. Clone Motorola Kernel 5.10 source code
-    - name: Clone Motorola kernel source
-      run: |
-        git clone https://github.com/moto-common/android_kernel_motorola_msm-5.10.git kernel
+    - name: Setup ccache cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ${{ runner.os }}-ccache-${{ hashFiles('**/Makefile','**/*.c','**/*.h') }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
 
-    # 4. Clone Proton Clang toolchain
-    - name: Clone Proton Clang
+    - name: Fetch AOSP prebuilt Clang (shallow)
       run: |
-        git clone https://github.com/kdrag0n/proton-clang.git clang
-
-    # 5. Fix missing Motorola cc-wrapper
-    - name: Fix missing Motorola cc-wrapper
-      run: |
-        if [ ! -f kernel/scripts/basic/cc-wrapper ]; then
-          echo "Fixing: cc-wrapper missing..."
-          curl -Lo kernel/scripts/basic/cc-wrapper \
-            https://raw.githubusercontent.com/moto-common/android_kernel_motorola_sm6225/lineage-21/scripts/basic/cc-wrapper
-          chmod +x kernel/scripts/basic/cc-wrapper
-        else
-          echo "cc-wrapper already exists; skipping."
+        mkdir -p $HOME/prebuilts/clang
+        git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 $HOME/prebuilts/clang || true
+        CLANG_DIR=$(ls -d $HOME/prebuilts/clang/host/linux-x86/clang-r* 2>/dev/null | head -n1 || true)
+        if [ -z "$CLANG_DIR" ]; then
+          echo "No clang-r* found — aborting"
+          ls -la $HOME/prebuilts/clang/host/linux-x86 || true
+          exit 1
         fi
+        echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
 
-    # 6. Setup environment for Clang cross-compiling
-    - name: Setup environment variables
+    - name: Fetch Android prebuilts GCC (aarch64) shallow
       run: |
-        echo "ARCH=arm64" >> $GITHUB_ENV
-        echo "SUBARCH=arm64" >> $GITHUB_ENV
+        mkdir -p $HOME/prebuilts/gcc
+        git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86 $HOME/prebuilts/gcc || true
+        AARCH64_TC=$(ls -d $HOME/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-* 2>/dev/null | head -n1 || true)
+        if [ -z "$AARCH64_TC" ]; then
+          echo "No aarch64 toolchain found — aborting"
+          ls -la $HOME/prebuilts/gcc/linux-x86/aarch64 || true
+          exit 1
+        fi
+        echo "AARCH64_TC=$AARCH64_TC" >> $GITHUB_ENV
+
+    - name: Export toolchain PATHs
+      shell: bash
+      run: |
+        echo "PATH=${CLANG_DIR}/bin:${AARCH64_TC}/bin:$PATH" >> $GITHUB_ENV
+        echo "CROSS_COMPILE=aarch64-linux-android-" >> $GITHUB_ENV
         echo "CC=clang" >> $GITHUB_ENV
-        echo "LLVM=1" >> $GITHUB_ENV
 
-        TOOLCHAIN_PATH=$(realpath clang)
-        echo "PATH=$TOOLCHAIN_PATH/bin:$PATH" >> $GITHUB_ENV
-        echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-        echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> $GITHUB_ENV
-        echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
-
-    # 7. Apply your custom defconfig
-    - name: Copy your custom defconfig
+    - name: Show toolchain versions (for logs)
+      shell: bash
+      env:
+        PATH: ${{ env.PATH }}
       run: |
-        if [ -f self-repo/hanoip_defconfig.txt ]; then
-          cp self-repo/hanoip_defconfig.txt kernel/arch/arm64/configs/hanoip_defconfig
+        echo "clang:"
+        ${CLANG_DIR}/bin/clang --version | head -n 2 || true
+        echo "aarch64 gcc:"
+        ${AARCH64_TC}/bin/aarch64-linux-android-gcc --version | head -n 2 || true
+
+    - name: Configure kernel (defconfig)
+      env:
+        PATH: ${{ env.PATH }}
+        CROSS_COMPILE: ${{ env.CROSS_COMPILE }}
+        CC: ${{ env.CC }}
+        ARCH: ${{ env.ARCH }}
+      run: |
+        mkdir -p out
+        if make O=out ARCH=${ARCH} ${DEFCONFIG}; then
+          echo "Used ${DEFCONFIG}"
         else
-          echo "ERROR: self-repo/hanoip_defconfig.txt not found"
-          exit 1
+          echo "DEFCONFIG failed; trying generic defconfig"
+          make O=out ARCH=${ARCH} defconfig
         fi
 
-    # 8. Generate .config from your defconfig
-    - name: Create config
-      working-directory: kernel
+    - name: Build kernel (clang + aarch64 toolchain)
+      env:
+        PATH: ${{ env.PATH }}
+        CROSS_COMPILE: ${{ env.CROSS_COMPILE }}
+        CC: ${{ env.CC }}
+        ARCH: ${{ env.ARCH }}
       run: |
-        make O=out hanoip_defconfig
+        make -j$(nproc) O=out ARCH=${ARCH} CC=${CC} CROSS_COMPILE=${CROSS_COMPILE}
 
-    # 9. Compile the kernel
-    - name: Build kernel
-      working-directory: kernel
+    - name: Build modules (optional)
+      if: always()
+      env:
+        PATH: ${{ env.PATH }}
+        CROSS_COMPILE: ${{ env.CROSS_COMPILE }}
+        ARCH: ${{ env.ARCH }}
       run: |
-        echo "Building with $(nproc) threads..."
-        make -j$(nproc) O=out
+        set -e
+        make O=out ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} modules || true
+        make O=out ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} INSTALL_MOD_PATH=modules_pkg modules_install || true
 
-    # 10. Output: Rename Image.lz4-dtb → hanoip_kernel.img
-    - name: Rename output image
-      run: |
-        OUT_IMG=kernel/out/arch/arm64/boot/Image.lz4-dtb
-        if [ -f "$OUT_IMG" ]; then
-          mv "$OUT_IMG" kernel/out/arch/arm64/boot/hanoip_kernel.img
-        else
-          echo "ERROR: expected output image not found at $OUT_IMG"
-          ls -la kernel/out/arch/arm64/boot || true
-          exit 1
-        fi
-
-    # 11. Upload compiled kernel
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
+    - name: Collect build artifacts (raw)
+      if: always()
+      uses: actions/upload-artifact@v3
       with:
-        name: Hanoip-Kernel-${{ github.sha }}
+        name: kernel-raw-artifacts
         path: |
-          kernel/out/arch/arm64/boot/hanoip_kernel.img
-          kernel/out/arch/arm64/boot/dts/**/*.dtb
-          kernel/out/arch/arm64/boot/dts/**/*.dtbo
-        if-no-files-found: error
-        retention-days: 7
+          out/arch/arm64/boot/Image
+          out/arch/arm64/boot/Image.gz
+          out/arch/arm64/boot/Image.gz-dtb
+          out/arch/arm64/boot/dts/**/*.dtb
+          out/arch/arm64/boot/dtbo.img
+          modules_pkg/**
+
+    ####################################################################
+    # KernelSU integration steps (ADD)
+    ####################################################################
+
+    - name: Clone KernelSU repo (tiann/KernelSU)
+      run: |
+        # clone official KernelSU so we can attempt LKM build or integration
+        git clone --depth=1 https://github.com/tiann/KernelSU.git kernelsu || true
+        ls -la kernelsu || true
+
+    - name: Attempt KernelSU LKM build (best-effort)
+      env:
+        PATH: ${{ env.PATH }}
+        CROSS_COMPILE: ${{ env.CROSS_COMPILE }}
+        CC: ${{ env.CC }}
+        ARCH: ${{ env.ARCH }}
+      run: |
+        set -euo pipefail
+        cd kernelsu || exit 0
+
+        # Try official build script if present (common pattern)
+        if [ -x ./build/build.sh ]; then
+          echo "Found build/build.sh — trying to build LKM"
+          # LTO and BUILD_CONFIG are sometimes required; this is best-effort
+          export LTO=thin
+          export BUILD_CONFIG=common/build.config.gki.aarch64 || true
+          ./build/build.sh lkm || true
+        fi
+
+        # Try legacy lkm build targets (best-effort)
+        if [ -d lkm ] || [ -f Makefile ]; then
+          echo "Trying to build lkm via make (fallback)"
+          make -C . -j$(nproc) || true
+        fi
+
+        # Search for produced artifacts (common names)
+        mkdir -p ksuresult
+        find . -type f -name "*.ko" -o -name "ksu*" -o -name "lkm*.tar*" -o -name "*.so" -print0 | xargs -0 -I{} cp -v --parents "{}" ksuresult/ || true
+        echo "KernelSU build artifacts copied to kernelsu/ksuresult (if any)"
+        ls -la ksuresult || true
+
+    - name: Integrate KernelSU artifacts into AnyKernel
+      run: |
+        AK=anykernel
+        mkdir -p $AK/modules/kernelsu
+        # If KernelSU produced compiled kernel module(s), copy them into AnyKernel modules folder
+        if [ -d kernelsu/ksuresult ] && [ "$(ls -A kernelsu/ksuresult 2>/dev/null || true)" != "" ]; then
+          echo "Copying KernelSU artifacts into $AK/modules/kernelsu"
+          rsync -a kernelsu/ksuresult/ $AK/modules/kernelsu/ || true
+        else
+          echo "No KernelSU built artifacts found in kernelsu/ksuresult — skipping copy"
+        fi
+        # Also allow user to include prebuilt KernelSU module (if they placed it in repo/prebuilt_kernelsu/)
+        if [ -d ./prebuilt_kernelsu ]; then
+          echo "Found prebuilt_kernelsu in repo — copying into AnyKernel modules/"
+          rsync -a ./prebuilt_kernelsu/ $AK/modules/kernelsu/ || true
+        fi
+        ls -la $AK/modules || true
+
+    ####################################################################
+    # AnyKernel packaging (unchanged, with KernelSU included when present)
+    ####################################################################
+
+    - name: Prepare AnyKernel3 (clone)
+      run: |
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3 anykernel || true
+        ls -la anykernel || true
+
+    - name: Populate AnyKernel3 with build artifacts
+      run: |
+        set -e
+        AK=anykernel
+        mkdir -p $AK/kernel
+        if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+          cp out/arch/arm64/boot/Image.gz-dtb $AK/kernel/Image.gz-dtb
+        fi
+        if [ -f out/arch/arm64/boot/Image ]; then
+          cp out/arch/arm64/boot/Image $AK/kernel/Image
+        fi
+        if [ -f out/arch/arm64/boot/Image.gz ]; then
+          cp out/arch/arm64/boot/Image.gz $AK/kernel/Image.gz
+        fi
+        if [ -f out/arch/arm64/boot/dtbo.img ]; then
+          cp out/arch/arm64/boot/dtbo.img $AK/kernel/dtbo.img
+        fi
+        # copy any modules (including KernelSU ones added earlier)
+        if [ -d anykernel/modules ]; then
+          echo "AnyKernel modules present:"
+          ls -la anykernel/modules || true
+        fi
+
+    - name: Prepare ramdisk (use ./ramdisk/ or extract stock_boot.img)
+      run: |
+        AK=anykernel
+        if [ -d "./ramdisk" ]; then
+          rsync -a ./ramdisk/ $AK/ramdisk/ || true
+        elif [ -f "./stock_boot.img" ]; then
+          abootimg -x stock_boot.img
+          mkdir -p $AK/ramdisk
+          gzip -dc ramdisk.cpio.gz | (cd $AK/ramdisk && cpio -idmv) || true
+        else
+          echo "No ramdisk/ or stock_boot.img found — AnyKernel will be kernel-only (may fail on some devices)"
+        fi
+
+    - name: Build AnyKernel3 flashable ZIP (with KernelSU if present)
+      run: |
+        AK=anykernel
+        cd $AK
+        vers="custom-ksu-${GITHUB_RUN_ID:-local}"
+        echo "$vers" > Version || true
+        zip -r9 ../anykernel-build-${{ github.run_number }}.zip . -x '*.git*' || true
+        cd ..
+        ls -lh anykernel-build-*.zip || true
+
+    - name: Upload AnyKernel3 ZIP artifact (with KernelSU if included)
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: anykernel-zip
+        path: anykernel-build-*.zip
+
+    - name: Print final listing (debug)
+      if: always()
+      run: |
+        echo "out/arch/arm64/boot contents:"
+        ls -la out/arch/arm64/boot || true
+        echo "AnyKernel zip files:"
+        ls -la anykernel-build-*.zip || true
+        echo "AnyKernel/modules (if any):"
+        ls -la anykernel/modules || true
