@@ -1,4 +1,4 @@
-name: Android Kernel Build + AnyKernel3 ZIP + KernelSU
+name: Android Kernel Build (disk-optimized) + AnyKernel3 + KernelSU
 
 on:
   push:
@@ -13,73 +13,57 @@ jobs:
     env:
       ARCH: arm64
       DEFCONFIG: hanoip_defconfig
-      AK_RAMDISK: "false"
+      # যদি আপনার রিপোতে stock_boot.img বা ramdisk থাকে, set to "true"
+      USE_STOCK_RAMDISK: "false"
+      # adjust parallelism if runner memory/disk low
+      PARALLELISM: $(nproc)
 
     steps:
     - name: Checkout source
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         submodules: 'recursive'
 
-    - name: Install system dependencies
+    - name: Install build dependencies (lightweight)
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
-          git build-essential bc bison flex libssl-dev \
+          build-essential bc bison flex libssl-dev \
           libncurses5-dev libncursesw5-dev python3 python3-pip \
-          ccache rsync unzip zip abootimg zstd
+          ccache rsync unzip zip abootimg zstd \
+          clang lld llvm binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+        # ensure ccache binary available
+        ccache --version || true
 
-    - name: Setup ccache cache
-      uses: actions/cache@v4
-      with:
-        path: ~/.ccache
-        key: ${{ runner.os }}-ccache-${{ hashFiles('**/Makefile','**/*.c','**/*.h') }}
-        restore-keys: |
-          ${{ runner.os }}-ccache-
-
-    - name: Fetch AOSP prebuilt Clang (shallow)
+    - name: Limit ccache size (prevent runaway)
       run: |
-        mkdir -p $HOME/prebuilts/clang
-        git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 $HOME/prebuilts/clang || true
-        CLANG_DIR=$(ls -d $HOME/prebuilts/clang/host/linux-x86/clang-r* 2>/dev/null | head -n1 || true)
-        if [ -z "$CLANG_DIR" ]; then
-          echo "No clang-r* found — aborting" ; ls -la $HOME/prebuilts/clang/host/linux-x86 || true ; exit 1
-        fi
-        echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
+        mkdir -p ~/.ccache
+        # set max cache to 1G
+        ccache --max-size=1G
+        echo "ccache size set:"
+        ccache -s || true
 
-    - name: Fetch Android prebuilts GCC (aarch64) shallow
+    - name: Show toolchain versions (logs)
       run: |
-        mkdir -p $HOME/prebuilts/gcc
-        git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86 $HOME/prebuilts/gcc || true
-        AARCH64_TC=$(ls -d $HOME/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-* 2>/dev/null | head -n1 || true)
-        if [ -z "$AARCH64_TC" ]; then
-          echo "No aarch64 toolchain found — aborting" ; ls -la $HOME/prebuilts/gcc/linux-x86/aarch64 || true ; exit 1
-        fi
-        echo "AARCH64_TC=$AARCH64_TC" >> $GITHUB_ENV
+        echo "clang:"
+        clang --version | head -n 2 || true
+        echo "lld:"
+        ld.lld --version 2>/dev/null || echo "ld.lld not available"
+        echo "aarch64-gcc:"
+        aarch64-linux-gnu-gcc --version | head -n 1 || true
 
-    - name: Export toolchain PATHs
-      shell: bash
+    - name: Prepare build dirs & env
       run: |
-        echo "PATH=${CLANG_DIR}/bin:${AARCH64_TC}/bin:$PATH" >> $GITHUB_ENV
-        echo "CROSS_COMPILE=aarch64-linux-android-" >> $GITHUB_ENV
-        echo "CC=clang" >> $GITHUB_ENV
-
-    - name: Show toolchain versions (for logs)
-      shell: bash
-      env:
-        PATH: ${{ env.PATH }}
-      run: |
-        echo "clang:"; ${CLANG_DIR}/bin/clang --version | head -n 2 || true
-        echo "aarch64 gcc:"; ${AARCH64_TC}/bin/aarch64-linux-android-gcc --version | head -n 2 || true
+        export PATH="$PATH"
+        mkdir -p out
+        # Show free space before build
+        df -h .
 
     - name: Configure kernel (defconfig)
       env:
-        PATH: ${{ env.PATH }}
-        CROSS_COMPILE: ${{ env.CROSS_COMPILE }}
-        CC: ${{ env.CC }}
         ARCH: ${{ env.ARCH }}
+        CROSS_COMPILE: aarch64-linux-gnu-
       run: |
-        mkdir -p out
         if make O=out ARCH=${ARCH} ${DEFCONFIG}; then
           echo "Used ${DEFCONFIG}"
         else
@@ -87,27 +71,35 @@ jobs:
           make O=out ARCH=${ARCH} defconfig
         fi
 
-    - name: Build kernel (clang + aarch64 toolchain)
+    - name: Build kernel (clang, disk-optimized flags)
       env:
-        PATH: ${{ env.PATH }}
-        CROSS_COMPILE: ${{ env.CROSS_COMPILE }}
-        CC: ${{ env.CC }}
         ARCH: ${{ env.ARCH }}
+        CROSS_COMPILE: aarch64-linux-gnu-
       run: |
-        make -j$(nproc) O=out ARCH=${ARCH} CC=${CC} CROSS_COMPILE=${CROSS_COMPILE}
+        # Use clang as front-end; use lld/LLVM flags to keep sizes and compatibility better
+        export CC=clang
+        export LD=ld.lld
+        export LLVM=1
+        export LLVM_IAS=1
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        # extra kcflags to reduce warnings/size if needed
+        export KCFLAGS="-Wno-unused-variable -Wno-unused-function"
+        # parallelism: lower if runner memory/disk constrained
+        JOBS=$(nproc)
+        echo "Building with JOBS=$JOBS"
+        make -j${JOBS} O=out ARCH=${ARCH} CC=${CC} LD=${LD} CROSS_COMPILE=${CROSS_COMPILE} LLVM=${LLVM} LLVM_IAS=${LLVM_IAS}
 
-    - name: Build modules (optional)
+    - name: Build modules (best-effort)
       if: always()
       env:
-        PATH: ${{ env.PATH }}
-        CROSS_COMPILE: ${{ env.CROSS_COMPILE }}
         ARCH: ${{ env.ARCH }}
+        CROSS_COMPILE: aarch64-linux-gnu-
       run: |
         set -e
         make O=out ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} modules || true
         make O=out ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} INSTALL_MOD_PATH=modules_pkg modules_install || true
 
-    - name: Collect build artifacts (raw)
+    - name: Collect raw build artifacts (upload)
       if: always()
       uses: actions/upload-artifact@v4
       with:
@@ -121,108 +113,122 @@ jobs:
           modules_pkg/**
 
     ####################################################################
-    # KernelSU integration steps
+    # KernelSU steps (best-effort; won't bloat storage because small)
     ####################################################################
 
-    - name: Clone KernelSU repo (tiann/KernelSU)
+    - name: Clone KernelSU (shallow)
       run: |
+        # shallow clone (small)
         git clone --depth=1 https://github.com/tiann/KernelSU.git kernelsu || true
         ls -la kernelsu || true
 
     - name: Attempt KernelSU LKM build (best-effort)
       env:
-        PATH: ${{ env.PATH }}
-        CROSS_COMPILE: ${{ env.CROSS_COMPILE }}
-        CC: ${{ env.CC }}
         ARCH: ${{ env.ARCH }}
+        CROSS_COMPILE: aarch64-linux-gnu-
       run: |
-        set -euo pipefail
+        set -eo pipefail
         cd kernelsu || exit 0
-        if [ -x ./build/build.sh ]; then
-          export LTO=thin
-          export BUILD_CONFIG=common/build.config.gki.aarch64 || true
+        # try common build script targets if present
+        if [ -x build/build.sh ]; then
+          export CC=clang
+          export CROSS_COMPILE=aarch64-linux-gnu-
           ./build/build.sh lkm || true
         fi
-        if [ -d lkm ] || [ -f Makefile ]; then
-          make -C . -j$(nproc) || true
+        # fallback make
+        if [ -f Makefile ]; then
+          make -j$(nproc) || true
         fi
+        # gather artifacts (if any)
         mkdir -p ksuresult
-        find . -type f -name "*.ko" -o -name "ksu*" -o -name "lkm*.tar*" -o -name "*.so" -print0 | xargs -0 -I{} cp -v --parents "{}" ksuresult/ || true
-        echo "KernelSU artifacts copied to kernelsu/ksuresult (if any)"
+        find . -type f -name "*.ko" -o -name "ksu*" -o -name "*.so" -print0 | xargs -0 -I{} cp -v --parents "{}" ksuresult/ || true
         ls -la ksuresult || true
 
-    - name: Integrate KernelSU artifacts into AnyKernel
-      run: |
-        AK=anykernel
-        mkdir -p $AK/modules/kernelsu
-        if [ -d kernelsu/ksuresult ] && [ "$(ls -A kernelsu/ksuresult 2>/dev/null || true)" != "" ]; then
-          rsync -a kernelsu/ksuresult/ $AK/modules/kernelsu/ || true
-        else
-          echo "No KernelSU built artifacts found — skipping copy"
-        fi
-        if [ -d ./prebuilt_kernelsu ]; then
-          rsync -a ./prebuilt_kernelsu/ $AK/modules/kernelsu/ || true
-        fi
-        ls -la $AK/modules || true
-
     ####################################################################
-    # AnyKernel packaging (unchanged, with KernelSU included when present)
+    # AnyKernel packaging (kernel-only or with ramdisk & KernelSU modules)
     ####################################################################
 
-    - name: Prepare AnyKernel3 (clone)
+    - name: Prepare AnyKernel3 template (shallow)
       run: |
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3 anykernel || true
         ls -la anykernel || true
 
-    - name: Populate AnyKernel3 with build artifacts
+    - name: Populate AnyKernel3 with build artifacts & KernelSU
       run: |
-        set -e
         AK=anykernel
         mkdir -p $AK/kernel
         if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then cp out/arch/arm64/boot/Image.gz-dtb $AK/kernel/Image.gz-dtb; fi
         if [ -f out/arch/arm64/boot/Image ]; then cp out/arch/arm64/boot/Image $AK/kernel/Image; fi
         if [ -f out/arch/arm64/boot/Image.gz ]; then cp out/arch/arm64/boot/Image.gz $AK/kernel/Image.gz; fi
         if [ -f out/arch/arm64/boot/dtbo.img ]; then cp out/arch/arm64/boot/dtbo.img $AK/kernel/dtbo.img; fi
+        # copy modules installed earlier
         if [ -d modules_pkg/lib ]; then rsync -a modules_pkg/lib/ $AK/modules/ || true; fi
+        # copy KernelSU artifacts (if exist)
+        if [ -d kernelsu/ksuresult ]; then mkdir -p $AK/modules/kernelsu && rsync -a kernelsu/ksuresult/ $AK/modules/kernelsu/ || true; fi
         ls -la $AK/kernel || true
         ls -la $AK/modules || true
 
-    - name: Prepare ramdisk (use ./ramdisk/ or extract stock_boot.img)
+    - name: Prepare ramdisk (optional)
       run: |
         AK=anykernel
-        if [ -d "./ramdisk" ]; then
-          rsync -a ./ramdisk/ $AK/ramdisk/ || true
-        elif [ -f "./stock_boot.img" ]; then
-          abootimg -x stock_boot.img
+        if [ "${{ env.USE_STOCK_RAMDISK }}" = "true" ] && [ -f "./stock_boot.img" ]; then
+          echo "Extracting ramdisk from stock_boot.img"
+          abootimg -x stock_boot.img || true
           mkdir -p $AK/ramdisk
           gzip -dc ramdisk.cpio.gz | (cd $AK/ramdisk && cpio -idmv) || true
+        elif [ -d "./ramdisk" ]; then
+          echo "Using repo's ramdisk/"
+          rsync -a ./ramdisk/ $AK/ramdisk/ || true
         else
-          echo "No ramdisk/ or stock_boot.img found — kernel-only AnyKernel zip will be created."
+          echo "No ramdisk provided; building kernel-only AnyKernel zip"
         fi
 
-    - name: Build AnyKernel3 flashable ZIP (with KernelSU if present)
+    - name: Build AnyKernel3 zip
       run: |
         AK=anykernel
         cd $AK
-        vers="custom-ksu-${GITHUB_RUN_ID:-local}"
+        vers="custom-optimized-${GITHUB_RUN_ID:-local}"
         echo "$vers" > Version || true
         zip -r9 ../anykernel-build-${{ github.run_number }}.zip . -x '*.git*' || true
         cd ..
         ls -lh anykernel-build-*.zip || true
 
-    - name: Upload AnyKernel3 ZIP artifact (with KernelSU if included)
+    - name: Upload AnyKernel3 ZIP
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: anykernel-zip
         path: anykernel-build-*.zip
 
-    - name: Print final listing (debug)
+    ####################################################################
+    # CRITICAL: Disk cleanup to avoid 'No space left on device'
+    ####################################################################
+
+    - name: Final disk cleanup (free runner space)
+      if: always()
+      run: |
+        echo "==== BEFORE CLEANUP ===="
+        df -h || true
+        # remove large temp dirs and toolchains
+        sudo rm -rf $HOME/prebuilts || true
+        sudo rm -rf kernelsu || true
+        sudo rm -rf modules_pkg || true
+        sudo rm -rf out/.cache || true
+        # clear apt cache
+        sudo apt-get clean || true
+        # clear npm / dotnet caches if they exist (some images)
+        sudo rm -rf /usr/share/dotnet || true
+        sudo rm -rf /opt/ghc || true
+        sudo rm -rf $HOME/.cargo || true
+        echo "==== AFTER CLEANUP ===="
+        df -h || true
+
+    - name: Print final listings (debug)
       if: always()
       run: |
         echo "out/arch/arm64/boot contents:"
         ls -la out/arch/arm64/boot || true
         echo "AnyKernel zip files:"
         ls -la anykernel-build-*.zip || true
-        echo "AnyKernel/modules (if any):"
+        echo "AnyKernel modules (if present):"
         ls -la anykernel/modules || true
