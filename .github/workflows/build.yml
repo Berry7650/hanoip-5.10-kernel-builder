@@ -1,4 +1,4 @@
-name: Android Kernel Build (disk-optimized) + AnyKernel3 + KernelSU
+name: Android Kernel Build (disk-optimized) + AnyKernel3 + KernelSU (auto-detect KERNEL_DIR)
 
 on:
   push:
@@ -12,17 +12,51 @@ jobs:
     runs-on: ubuntu-22.04
     env:
       ARCH: arm64
+      # আপনার defconfig যদি আলাদা নাম হয় তাহলে এখানে পরিবর্তন করুন বা repo secret/env ব্যবহার করুন
       DEFCONFIG: hanoip_defconfig
-      # যদি আপনার রিপোতে stock_boot.img বা ramdisk থাকে, set to "true"
+      # যদি আপনার রেপোতে stock_boot.img বা ramdisk থাকে, set to "true"
       USE_STOCK_RAMDISK: "false"
-      # adjust parallelism if runner memory/disk low
-      PARALLELISM: $(nproc)
 
     steps:
-    - name: Checkout source
+    - name: Checkout source (with submodules)
       uses: actions/checkout@v4
       with:
         submodules: 'recursive'
+
+    - name: Quick repo scan (debug)
+      run: |
+        echo "Top-level files:"
+        ls -la
+        echo "Searching for potential kernel roots (Makefile + arch/arm64)..."
+        find . -maxdepth 6 -type f -name Makefile -printf '%h\n' | sort -u | while read d; do
+          echo "Candidate: $d"
+          if [ -d "$d/arch/arm64" ]; then
+            echo " -> has arch/arm64"
+          fi
+        done
+
+    - name: Detect kernel source root
+      id: detect_kernel
+      run: |
+        KERNEL_DIR=""
+        # খোঁজ: কোনো সাব-ডিরেক্টরি যা একটি Makefile রাখে এবং সেই ডিরেক্টরেই arch/arm64 আছে
+        # maxdepth 6: দরকারে বড় করে নিন
+        for d in $(find . -maxdepth 6 -type f -name Makefile -printf '%h\n' | sort -u); do
+          if [ -d "$d/arch/arm64" ]; then
+            KERNEL_DIR="$d"
+            break
+          fi
+        done
+        if [ -z "$KERNEL_DIR" ]; then
+          echo "ERROR: kernel root not found under repo. Please set KERNEL_DIR manually as env."
+          ls -la
+          exit 1
+        fi
+        # normalize and export
+        KERNEL_DIR=${KERNEL_DIR#./}
+        echo "Detected kernel dir: $KERNEL_DIR"
+        echo "KERNEL_DIR=$KERNEL_DIR" >> $GITHUB_ENV
+        echo "::set-output name=kernel_dir::$KERNEL_DIR"
 
     - name: Install build dependencies (lightweight)
       run: |
@@ -32,7 +66,6 @@ jobs:
           libncurses5-dev libncursesw5-dev python3 python3-pip \
           ccache rsync unzip zip abootimg zstd \
           clang lld llvm binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
-        # ensure ccache binary available
         ccache --version || true
 
     - name: Limit ccache size (prevent runaway)
@@ -40,7 +73,7 @@ jobs:
         mkdir -p ~/.ccache
         # set max cache to 1G
         ccache --max-size=1G
-        echo "ccache size set:"
+        echo "ccache status:"
         ccache -s || true
 
     - name: Show toolchain versions (logs)
@@ -51,46 +84,48 @@ jobs:
         ld.lld --version 2>/dev/null || echo "ld.lld not available"
         echo "aarch64-gcc:"
         aarch64-linux-gnu-gcc --version | head -n 1 || true
-
-    - name: Prepare build dirs & env
-      run: |
-        export PATH="$PATH"
-        mkdir -p out
-        # Show free space before build
         df -h .
 
     - name: Configure kernel (defconfig)
+      # run make in detected kernel root
+      working-directory: ${{ env.KERNEL_DIR }}
       env:
         ARCH: ${{ env.ARCH }}
         CROSS_COMPILE: aarch64-linux-gnu-
       run: |
+        echo "Working directory: $(pwd)"
+        echo "List top-level in kernel dir:"
+        ls -la | sed -n '1,120p'
+        echo "List arch/arm64/configs (if exists):"
+        ls -la arch/arm64/configs || true
+        # Try the provided DEFCONFIG; if it fails, print configs and exit non-zero
         if make O=out ARCH=${ARCH} ${DEFCONFIG}; then
           echo "Used ${DEFCONFIG}"
         else
-          echo "DEFCONFIG failed; trying generic defconfig"
-          make O=out ARCH=${ARCH} defconfig
+          echo "DEFCONFIG ${DEFCONFIG} failed — listing available configs"
+          ls -la arch/arm64/configs || true
+          # fail early so you can inspect logs and set correct DEFCONFIG
+          exit 1
         fi
 
     - name: Build kernel (clang, disk-optimized flags)
+      working-directory: ${{ env.KERNEL_DIR }}
       env:
         ARCH: ${{ env.ARCH }}
         CROSS_COMPILE: aarch64-linux-gnu-
       run: |
-        # Use clang as front-end; use lld/LLVM flags to keep sizes and compatibility better
         export CC=clang
         export LD=ld.lld
         export LLVM=1
         export LLVM_IAS=1
         export CROSS_COMPILE=aarch64-linux-gnu-
-        # extra kcflags to reduce warnings/size if needed
-        export KCFLAGS="-Wno-unused-variable -Wno-unused-function"
-        # parallelism: lower if runner memory/disk constrained
         JOBS=$(nproc)
-        echo "Building with JOBS=$JOBS"
+        echo "Building with JOBS=$JOBS in $(pwd)"
         make -j${JOBS} O=out ARCH=${ARCH} CC=${CC} LD=${LD} CROSS_COMPILE=${CROSS_COMPILE} LLVM=${LLVM} LLVM_IAS=${LLVM_IAS}
 
     - name: Build modules (best-effort)
       if: always()
+      working-directory: ${{ env.KERNEL_DIR }}
       env:
         ARCH: ${{ env.ARCH }}
         CROSS_COMPILE: aarch64-linux-gnu-
@@ -105,30 +140,38 @@ jobs:
       with:
         name: kernel-raw-artifacts
         path: |
-          out/arch/arm64/boot/Image
-          out/arch/arm64/boot/Image.gz
-          out/arch/arm64/boot/Image.gz-dtb
-          out/arch/arm64/boot/dts/**/*.dtb
-          out/arch/arm64/boot/dtbo.img
+          ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image
+          ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz
+          ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz-dtb
+          ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dts/**/*.dtb
+          ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dtbo.img
           modules_pkg/**
 
     ####################################################################
-    # KernelSU steps (best-effort; won't bloat storage because small)
+    # AnyKernel3 template (prepare before KernelSU integration)
+    ####################################################################
+
+    - name: Prepare AnyKernel3 template (shallow)
+      run: |
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3 anykernel || true
+        ls -la anykernel || true
+
+    ####################################################################
+    # KernelSU steps (best-effort)
     ####################################################################
 
     - name: Clone KernelSU (shallow)
       run: |
-        # shallow clone (small)
         git clone --depth=1 https://github.com/tiann/KernelSU.git kernelsu || true
         ls -la kernelsu || true
 
     - name: Attempt KernelSU LKM build (best-effort)
+      working-directory: kernelsu
       env:
         ARCH: ${{ env.ARCH }}
         CROSS_COMPILE: aarch64-linux-gnu-
       run: |
         set -eo pipefail
-        cd kernelsu || exit 0
         # try common build script targets if present
         if [ -x build/build.sh ]; then
           export CC=clang
@@ -144,27 +187,36 @@ jobs:
         find . -type f -name "*.ko" -o -name "ksu*" -o -name "*.so" -print0 | xargs -0 -I{} cp -v --parents "{}" ksuresult/ || true
         ls -la ksuresult || true
 
-    ####################################################################
-    # AnyKernel packaging (kernel-only or with ramdisk & KernelSU modules)
-    ####################################################################
-
-    - name: Prepare AnyKernel3 template (shallow)
+    - name: Integrate KernelSU artifacts into AnyKernel
       run: |
-        git clone --depth=1 https://github.com/osm0sis/AnyKernel3 anykernel || true
-        ls -la anykernel || true
+        AK=anykernel
+        mkdir -p $AK/modules/kernelsu
+        if [ -d kernelsu/ksuresult ] && [ "$(ls -A kernelsu/ksuresult 2>/dev/null || true)" != "" ]; then
+          echo "Copying KernelSU artifacts into AnyKernel modules"
+          rsync -a kernelsu/ksuresult/ $AK/modules/kernelsu/ || true
+        else
+          echo "No KernelSU built artifacts found — skipping copy"
+        fi
+        if [ -d ./prebuilt_kernelsu ]; then
+          echo "Found prebuilt_kernelsu in repo — copying into AnyKernel modules/"
+          rsync -a ./prebuilt_kernelsu/ $AK/modules/kernelsu/ || true
+        fi
+        ls -la $AK/modules || true
+
+    ####################################################################
+    # Populate AnyKernel3 with kernel & modules
+    ####################################################################
 
     - name: Populate AnyKernel3 with build artifacts & KernelSU
       run: |
         AK=anykernel
         mkdir -p $AK/kernel
-        if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then cp out/arch/arm64/boot/Image.gz-dtb $AK/kernel/Image.gz-dtb; fi
-        if [ -f out/arch/arm64/boot/Image ]; then cp out/arch/arm64/boot/Image $AK/kernel/Image; fi
-        if [ -f out/arch/arm64/boot/Image.gz ]; then cp out/arch/arm64/boot/Image.gz $AK/kernel/Image.gz; fi
-        if [ -f out/arch/arm64/boot/dtbo.img ]; then cp out/arch/arm64/boot/dtbo.img $AK/kernel/dtbo.img; fi
-        # copy modules installed earlier
+        if [ -f "${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz-dtb" ]; then cp "${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz-dtb" $AK/kernel/Image.gz-dtb; fi
+        if [ -f "${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image" ]; then cp "${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image" $AK/kernel/Image; fi
+        if [ -f "${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz" ]; then cp "${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz" $AK/kernel/Image.gz; fi
+        if [ -f "${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dtbo.img" ]; then cp "${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dtbo.img" $AK/kernel/dtbo.img; fi
         if [ -d modules_pkg/lib ]; then rsync -a modules_pkg/lib/ $AK/modules/ || true; fi
-        # copy KernelSU artifacts (if exist)
-        if [ -d kernelsu/ksuresult ]; then mkdir -p $AK/modules/kernelsu && rsync -a kernelsu/ksuresult/ $AK/modules/kernelsu/ || true; fi
+        # KernelSU modules (already copied in previous step)
         ls -la $AK/kernel || true
         ls -la $AK/modules || true
 
@@ -201,7 +253,7 @@ jobs:
         path: anykernel-build-*.zip
 
     ####################################################################
-    # CRITICAL: Disk cleanup to avoid 'No space left on device'
+    # CRITICAL: Final disk cleanup (free runner space)
     ####################################################################
 
     - name: Final disk cleanup (free runner space)
@@ -209,14 +261,11 @@ jobs:
       run: |
         echo "==== BEFORE CLEANUP ===="
         df -h || true
-        # remove large temp dirs and toolchains
         sudo rm -rf $HOME/prebuilts || true
         sudo rm -rf kernelsu || true
         sudo rm -rf modules_pkg || true
-        sudo rm -rf out/.cache || true
-        # clear apt cache
+        sudo rm -rf "${{ env.KERNEL_DIR }}/out/.cache" || true
         sudo apt-get clean || true
-        # clear npm / dotnet caches if they exist (some images)
         sudo rm -rf /usr/share/dotnet || true
         sudo rm -rf /opt/ghc || true
         sudo rm -rf $HOME/.cargo || true
@@ -226,8 +275,8 @@ jobs:
     - name: Print final listings (debug)
       if: always()
       run: |
-        echo "out/arch/arm64/boot contents:"
-        ls -la out/arch/arm64/boot || true
+        echo "Kernel out dir listing (if exists):"
+        ls -la "${{ env.KERNEL_DIR }}/out/arch/arm64/boot" || true
         echo "AnyKernel zip files:"
         ls -la anykernel-build-*.zip || true
         echo "AnyKernel modules (if present):"
